@@ -45,8 +45,10 @@
   const LOGO = '<svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="9" class="logo-bg"/><path d="M8.5 19.5l4.5-4.5 3.5 3.5 7-7" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
   // ---------- state + server
-  const S = { bank: null, state: null, me: LS.get('dp.me', null), run: LS.get('dp.run', null) };
-  const saveRun = () => LS.set('dp.run', S.run);
+  const S = { bank: null, state: null, me: LS.get('dp.me', null), run: null };
+  // One saved test per person, so on a shared laptop nobody can wipe someone else's exam.
+  const saveRun = () => LS.set('dp.run.' + S.me, S.run);
+  const loadRun = () => { S.run = S.me ? LS.get('dp.run.' + S.me, null) : null; };
 
   async function api(url, body) {
     const r = await fetch(url, body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -103,9 +105,9 @@
       if (++this.n % 5 === 0) saveRun();
       if (this.n % 240 === 0 && this.was) api('/api/ping').catch(() => {}); // keeps the free server awake mid-test
     },
-    input() {
+    input(e) {
       const idle = Date.now() - this.lastInput >= IDLE_MS;
-      if (idle) this.tick();
+      if (idle) { this.tick(); if (e) e.wake = true; } // the key that wakes the page must not also answer
       this.lastInput = Date.now();
       if (idle) this.tick();
     }
@@ -118,7 +120,7 @@
     const idle = document.visibilityState === 'visible' && Date.now() - Timer.lastInput >= IDLE_MS;
     document.getElementById('idle').classList.toggle('show', idle);
   }
-  ['pointerdown', 'keydown', 'wheel', 'touchstart', 'scroll'].forEach((t) => addEventListener(t, () => Timer.input(), { passive: true, capture: true }));
+  ['pointerdown', 'keydown', 'wheel', 'touchstart', 'scroll'].forEach((t) => addEventListener(t, (e) => Timer.input(e), { passive: true, capture: true }));
   let moved = 0;
   addEventListener('pointermove', () => { const n = Date.now(); if (n - moved > 1000) { moved = n; Timer.input(); } }, { passive: true });
   function awayCheck() {
@@ -184,33 +186,42 @@
     clearTimeout(toastT);
     toastT = setTimeout(() => t.classList.remove('show'), 5000);
   }
-  function modalEl(inner) {
-    const el = document.createElement('div');
-    el.className = 'modal';
-    el.innerHTML = `<div class="modal-card" role="dialog" aria-modal="true">${inner}</div>`;
-    document.body.appendChild(el);
-    return el;
+  // Native <dialog>: focus stays inside, Esc closes (unless locked), focus returns to where it was.
+  function modalEl(inner, locked) {
+    const back = document.activeElement;
+    const d = document.createElement('dialog');
+    d.className = 'dlg';
+    d.setAttribute('aria-labelledby', 'dlg-title');
+    d.innerHTML = inner;
+    document.body.appendChild(d);
+    d.addEventListener('cancel', (e) => { if (locked) e.preventDefault(); });
+    d.addEventListener('close', () => { d.remove(); if (back && document.contains(back)) back.focus(); });
+    d.addEventListener('click', (e) => {
+      if (locked || e.target !== d) return;
+      const r = d.getBoundingClientRect();
+      if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) d.close();
+    });
+    d.showModal();
+    return d;
   }
   function confirmBox(title, body, ok, cancel) {
     return new Promise((resolve) => {
-      const el = modalEl(`<h2>${esc(title)}</h2><p class="muted">${esc(body)}</p><div class="modal-actions"><button class="btn ghost" data-v="0">${esc(cancel)}</button><button class="btn primary" data-v="1">${esc(ok)}</button></div>`);
-      el.addEventListener('click', (e) => {
-        const b = e.target.closest('[data-v]');
-        if (b || e.target === el) { el.remove(); resolve(!!b && b.dataset.v === '1'); }
-      });
-      el.querySelector('[data-v="1"]').focus();
+      const d = modalEl(`<h2 id="dlg-title">${esc(title)}</h2><p class="muted">${esc(body)}</p><div class="modal-actions"><button class="btn ghost" data-v="0" autofocus>${esc(cancel)}</button><button class="btn primary" data-v="1">${esc(ok)}</button></div>`);
+      d.addEventListener('click', (e) => { const b = e.target.closest('[data-v]'); if (b) d.close(b.dataset.v); });
+      d.addEventListener('close', () => resolve(d.returnValue === '1'));
     });
   }
   const avatar = (name, size) => `<span class="av c${Math.max(0, S.state.team.indexOf(name)) % 4}${size ? ' ' + size : ''}" aria-hidden="true">${esc(name.slice(0, 1).toUpperCase())}</span>`;
   function pickMe() {
-    const el = modalEl(`<h2>Who's studying?</h2><p class="muted">Tests on this device are logged under this name.</p>
-      <div class="pick">${S.state.team.map((n) => `<button data-me="${esc(n)}">${avatar(n, 'lg')}<span>${esc(n)}</span></button>`).join('')}</div>`);
-    el.addEventListener('click', async (e) => {
+    const d = modalEl(`<h2 id="dlg-title">Who's studying?</h2><p class="muted">Tests on this device are logged under this name.</p>
+      <div class="pick">${S.state.team.map((n) => `<button data-me="${esc(n)}"${n === S.me ? ' aria-current="true" autofocus' : ''}>${avatar(n, 'lg')}<span>${esc(n)}</span></button>`).join('')}</div>`, !S.me);
+    d.addEventListener('click', async (e) => {
       const b = e.target.closest('[data-me]');
-      if (!b) { if (e.target === el && S.me) el.remove(); return; }
+      if (!b) return;
       S.me = b.dataset.me;
       LS.set('dp.me', S.me);
-      el.remove();
+      loadRun();
+      d.close();
       await loadState().catch(() => {});
       render();
     });
@@ -244,6 +255,7 @@
         <div class="sec-head"><h2>Team today</h2><p class="muted">${done} of ${st.members.length} done · goal: one full mock exam a day</p></div>
         <div class="team">${st.members.map(memberCard).join('')}</div>
       </section>
+      ${history()}
       <section class="sec">
         <div class="sec-head"><h2>Study</h2></div>
         <div class="tools">
@@ -282,7 +294,9 @@
       const d = addDays(first, i);
       const s = d > today ? 'future' : d < start ? 'off' : done.has(d) ? 'done' : d === today ? 'today' : 'miss';
       const label = { future: '', off: 'before the team started', done: 'done', today: 'today, not done yet', miss: 'missed' }[s];
-      cells += `<i class="d d-${s}" title="${d}${label ? ': ' + label : ''}"></i>`;
+      const day = m.daily[d];
+      const nums = day && day[0] ? ` · ${day[1]} right, ${day[0] - day[1]} wrong of ${day[0]}` : '';
+      cells += `<i class="d d-${s}" title="${d}${label ? ': ' + label : ''}${nums}"></i>`;
     }
     return `<div class="cal"><div class="cal-h" aria-hidden="true">${['M', 'T', 'W', 'T', 'F', 'S', 'S'].map((c) => `<span>${c}</span>`).join('')}</div>
       <div class="cal-g" role="img" aria-label="${esc(m.name)}: ${m.done.length} days done so far">${cells}</div></div>`;
@@ -296,6 +310,7 @@
         <div class="stk${m.streak ? ' hot' : ''}">${ic('flame')}<div><b class="num">${m.streak}</b><span>day streak</span></div></div>
         <div class="stk${m.missed ? ' cold' : ''}">${ic('down')}<div><b class="num">${m.missed ? '−' + m.missed : '0'}</b><span>missed in a row</span></div></div>
       </div>
+      ${dayStats(m.daily[S.state.today])}
       ${calendar(m)}
       <dl class="mstats">
         <div><dt>Last mock</dt><dd class="num">${m.last ? pct(m.last.ok, m.last.n) + '%' : '—'}</dd></div>
@@ -303,6 +318,29 @@
         <div><dt>This week</dt><dd class="num">${fmtDur(m.weekSec)}</dd></div>
       </dl>
     </article>`;
+  }
+  // Questions answered today (mocks + practice) for one person: [answered, right].
+  function dayStats(d) {
+    const [n, ok] = d || [0, 0];
+    return `<div class="daystats" role="group" aria-label="Today: ${n} questions, ${ok} right, ${n - ok} wrong">
+      <div><b class="num">${n}</b><span>questions today</span></div>
+      <div class="ok"><b class="num">${ok}</b><span>right</span></div>
+      <div class="no"><b class="num">${n - ok}</b><span>wrong</span></div></div>`;
+  }
+  function history() {
+    const { today, start, members } = S.state;
+    const days = [];
+    for (let i = 0; i < 7; i++) { const d = addDays(today, -i); if (d >= start) days.push(d); }
+    const label = (d) => (d === today ? 'Today' : new Date(d + 'T12:00:00Z').toLocaleDateString('en-CA', { weekday: 'short', day: 'numeric', timeZone: 'UTC' }));
+    const cell = (m, d) => {
+      const s = m.daily[d];
+      if (!s || !s[0]) return '<td><span class="muted">—</span></td>';
+      return `<td><span class="tot num">${m.done.includes(d) ? '<i class="dot" title="Mock exam counted"></i>' : ''}${s[0]} done</span>
+        <span class="rw num"><span class="r">${ic('check')}${s[1]}<span class="vh"> right</span></span><span class="w">${ic('x')}${s[0] - s[1]}<span class="vh"> wrong</span></span></span></td>`;
+    };
+    return `<section class="sec"><div class="sec-head"><h2>Last 7 days</h2><p class="muted">Questions answered each day, mocks and practice</p></div>
+      <div class="card hist"><table><thead><tr><th scope="col">Day</th>${members.map((m) => `<th scope="col">${esc(m.name)}</th>`).join('')}</tr></thead>
+      <tbody>${days.map((d) => `<tr><th scope="row">${esc(label(d))}</th>${members.map((m) => cell(m, d)).join('')}</tr>`).join('')}</tbody></table></div></section>`;
   }
   function feed() {
     const rec = S.state.recent;
@@ -316,7 +354,7 @@
 
   // ---------- setup screens
   function mockSetup() {
-    const exams = S.bank.exams.filter((e) => e.n >= 90);
+    const exams = S.bank.exams.filter((e) => e.n >= S.state.rules.mock); // shorter sets could never count for the day
     app.innerHTML = shell(`${backLink()}
       <section class="setup card">
         <span class="tile accent big">${ic('target')}</span>
@@ -345,7 +383,7 @@
         <h1>Practice</h1>
         <p class="lead">One question at a time. You'll see right away if you got it, with a short, plain explanation.</p>
         <span class="field-l" id="n-l">How many questions</span>
-        <div class="seg" role="radiogroup" aria-labelledby="n-l">${[10, 25, 50, 100].map((n) => `<button role="radio" data-act="seg" data-n="${n}" aria-checked="${n === 25}" class="${n === 25 ? 'on' : ''}">${n}</button>`).join('')}</div>
+        <div class="seg" role="radiogroup" aria-labelledby="n-l">${[10, 25, 50, 100].map((n) => `<label><input type="radio" name="count" value="${n}"${n === 25 ? ' checked' : ''}><span>${n}</span></label>`).join('')}</div>
         <label class="field-l" for="area">Topic</label>
         <select id="area" class="input"><option value="">All topics (${S.bank.questions.length} questions)</option>${areas.map((k) => `<option value="${k}">${esc(areaName(k))} (${S.bank.areas[k].length})</option>`).join('')}</select>
         <label class="check"><input type="checkbox" id="mist"${missed ? '' : ' disabled'}><span>Only questions I got wrong last time <span class="muted">(${missed})</span></span></label>
@@ -354,23 +392,37 @@
   }
 
   // ---------- the test runner (mock + practice)
-  async function startRun(mode, qids, ex) {
+  let starting = false;
+  async function startRun(mode, qids, ex, btn) {
+    if (starting) return;
     if (!qids.length) return toast('No questions match that choice yet.');
-    if (S.run && S.run.m === S.me && S.run.mode === 'mock' && Object.keys(S.run.ans).length &&
+    if (S.run && S.run.mode === 'mock' && Object.keys(S.run.ans).length &&
       !(await confirmBox('Start over?', 'You have a mock exam in progress. Starting something new throws it away.', 'Start new', 'Keep it'))) return;
-    let id, st;
-    try { ({ id, st } = await api('/api/run/start', { member: S.me, mode, qids, ex })); }
-    catch (e) { if (e.message === 'locked') return; id = 'l' + Math.random().toString(36).slice(2, 12); st = Date.now(); }
-    S.run = { id, m: S.me, mode, ex: ex || null, qids, st, ans: {}, flags: {}, idx: 0, act: 0 };
-    saveRun();
-    if (location.hash === '#/run') render(); else location.hash = '#/run';
+    starting = true;
+    const label = btn ? btn.innerHTML : '';
+    if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
+    const slow = setTimeout(() => toast('Waking up the server. On free hosting this can take up to a minute.'), 4000);
+    try {
+      // Tests start on the server: its clock is what lets a mock count for the day.
+      const { id, st } = await api('/api/run/start', { member: S.me, mode, qids, ex });
+      S.run = { id, m: S.me, mode, ex: ex || null, qids, st, ans: {}, flags: {}, idx: 0, act: 0 };
+      saveRun();
+      if (location.hash === '#/run') render(); else location.hash = '#/run';
+    } catch (e) {
+      if (e.message !== 'locked') toast('Couldn’t reach the server, so nothing started. Check your connection and try again.');
+    } finally {
+      clearTimeout(slow);
+      starting = false;
+      if (btn && document.contains(btn)) { btn.disabled = false; btn.innerHTML = label; }
+    }
   }
   function runView() {
     if (!S.run || S.run.m !== S.me) { location.hash = '#/'; return; }
     Timer.start();
     drawRun();
   }
-  function drawRun() {
+  // focus: where keyboard/screen-reader focus lands after the redraw ('fb' = feedback, 'flag', or the question)
+  function drawRun(focus) {
     const r = S.run;
     const q = S.bank.byId.get(r.qids[r.idx]);
     if (!q) { S.run = null; saveRun(); location.hash = '#/'; return; }
@@ -383,13 +435,13 @@
     app.innerHTML = `<div class="runner">
       <header class="run-top">
         <button class="icon-btn" data-act="exit" aria-label="${mock ? 'Leave the exam' : 'End practice'}">${ic('x')}</button>
-        <div class="bar" role="progressbar" aria-label="Progress" aria-valuemin="1" aria-valuemax="${r.qids.length}" aria-valuenow="${r.idx + 1}"><span style="width:${((r.idx + 1) / r.qids.length) * 100}%"></span></div>
+        <div class="bar" role="progressbar" aria-label="Progress" aria-valuemin="1" aria-valuemax="${r.qids.length}" aria-valuenow="${r.idx + 1}" aria-valuetext="Question ${r.idx + 1} of ${r.qids.length}"><span style="width:${((r.idx + 1) / r.qids.length) * 100}%"></span></div>
         <span class="count num">${r.idx + 1}<span class="muted"> / ${r.qids.length}</span></span>
         <span class="timer num" id="timer" title="Active study time. Pauses when you leave the tab or go idle.">${ic('clock')}<span id="timer-v">${fmtClock(r.act)}</span><span class="paused-tag">Paused</span></span>
       </header>
       <main class="run-body">
         <p class="q-meta">${mock ? 'Mock exam' : 'Practice'} · ${esc(areaName(q.ar))}${r.flags[q.id] ? ` · <span class="flag-tag">${ic('flag')}Flagged</span>` : ''}</p>
-        <h1 class="q-text">${esc(q.q)}</h1>
+        <h1 class="q-text" tabindex="-1">${esc(q.q)}</h1>
         <div class="opts">${q.o.map((o, i) => {
           let c = 'opt';
           if (chosen === i) c += ' sel';
@@ -400,12 +452,12 @@
         ${shown ? feedback(q, chosen) : ''}
       </main>
       <footer class="run-bar"><div class="run-bar-in">${mock
-        ? `<button class="btn ghost" data-act="back"${r.idx ? '' : ' disabled'} aria-label="Previous question">${ic('l')}<span class="hide-sm">Back</span></button>
+        ? `<button class="btn ghost" data-act="back"${r.idx ? '' : ' disabled'}>${ic('l')}<span class="hide-sm">Back</span></button>
            <button class="btn ghost${r.flags[q.id] ? ' on' : ''}" data-act="flag" aria-pressed="${!!r.flags[q.id]}">${ic('flag')}<span class="hide-sm">${r.flags[q.id] ? 'Flagged' : 'Flag'}</span></button>
-           <button class="btn ghost" data-act="nav" aria-label="All questions">${ic('grid')}<span class="num">${answered}/${r.qids.length}</span></button>
+           <button class="btn ghost" data-act="nav" aria-label="All questions, ${answered} of ${r.qids.length} answered">${ic('grid')}<span class="num">${answered}/${r.qids.length}</span></button>
            <span class="spacer"></span>
            ${last ? '<button class="btn primary" data-act="finish">Finish exam</button>' : `<button class="btn primary" data-act="next">Next${ic('r')}</button>`}`
-        : `<button class="btn ghost" data-act="exit">End<span class="hide-sm">session</span></button>
+        : `<button class="btn ghost" data-act="exit">End <span class="hide-sm">session</span></button>
            <span class="hint num">${right} / ${answered} correct</span>
            <span class="spacer"></span>
            <button class="btn primary" data-act="next"${shown ? '' : ' disabled'}>${last ? 'See results' : 'Next'}${ic('r')}</button>`}
@@ -413,11 +465,13 @@
       <div class="idle" id="idle"><div class="idle-card">${ic('pause')}<h2>Timer paused</h2><p>No activity for 2 minutes, so the clock stopped. Move the mouse or press any key to keep going.</p></div></div>
     </div>`;
     paintTimer();
+    const f = focus === 'fb' ? app.querySelector('.fb') : focus === 'flag' ? app.querySelector('[data-act="flag"]') : app.querySelector('.q-text');
+    if (f) f.focus({ preventScroll: true });
   }
   function feedback(q, chosen) {
     const ok = chosen === q.a;
     const e = explain(q, chosen);
-    return `<section class="fb ${ok ? 'ok' : 'no'}" aria-live="polite">
+    return `<section class="fb ${ok ? 'ok' : 'no'}" tabindex="-1">
       <p class="fb-head">${ic(ok ? 'check' : 'x')}${ok ? 'Correct!' : `Not quite. The answer is ${L[q.a]}.`}</p>
       <p><span class="lbl">In short</span>${esc(e.short)}</p>
       ${e.whyNot ? `<p><span class="lbl">Why not ${L[chosen]}</span>${esc(e.whyNot)}</p>` : ''}
@@ -431,7 +485,7 @@
     if (r.mode === 'practice' && r.ans[id] != null) return;
     r.ans[id] = i;
     saveRun();
-    drawRun();
+    drawRun(r.mode === 'practice' ? 'fb' : undefined);
     if (r.mode === 'practice') { const fb = document.querySelector('.fb'); if (fb) fb.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); }
   }
   function step(d) {
@@ -443,13 +497,16 @@
   }
   function openNav() {
     const r = S.run;
-    const el = modalEl(`<h2>All questions</h2><p class="muted">${Object.keys(r.ans).length} of ${r.qids.length} answered${Object.keys(r.flags).length ? ' · ' + Object.keys(r.flags).length + ' flagged' : ''}</p>
-      <div class="navgrid">${r.qids.map((id, i) => `<button data-jump="${i}" class="${r.ans[id] != null ? 'a' : ''}${r.flags[id] ? ' f' : ''}${i === r.idx ? ' cur' : ''}" aria-label="Question ${i + 1}">${i + 1}</button>`).join('')}</div>
+    const d = modalEl(`<h2 id="dlg-title">All questions</h2><p class="muted">${Object.keys(r.ans).length} of ${r.qids.length} answered${Object.keys(r.flags).length ? ' · ' + Object.keys(r.flags).length + ' flagged' : ''}</p>
+      <div class="navgrid">${r.qids.map((id, i) => {
+        const st = (r.ans[id] != null ? 'answered' : 'not answered') + (r.flags[id] ? ', flagged' : '');
+        return `<button data-jump="${i}" class="${r.ans[id] != null ? 'a' : ''}${r.flags[id] ? ' f' : ''}${i === r.idx ? ' cur' : ''}" aria-label="Question ${i + 1}, ${st}"${i === r.idx ? ' aria-current="true" autofocus' : ''}>${i + 1}</button>`;
+      }).join('')}</div>
       <div class="legend"><span><i class="lg-a"></i>Answered</span><span><i class="lg-f"></i>Flagged</span></div>
       <div class="modal-actions"><button class="btn ghost" data-close>Close</button></div>`);
-    el.addEventListener('click', (e) => {
+    d.addEventListener('click', (e) => {
       const b = e.target.closest('[data-jump]');
-      if (b) { r.idx = +b.dataset.jump; saveRun(); el.remove(); drawRun(); scrollTo(0, 0); } else if (e.target.closest('[data-close]') || e.target === el) el.remove();
+      if (b) { r.idx = +b.dataset.jump; saveRun(); d.close(); drawRun(); scrollTo(0, 0); } else if (e.target.closest('[data-close]')) d.close();
     });
   }
   async function finishMock() {
@@ -491,7 +548,8 @@
     location.hash = '#/result/' + a.id;
     try {
       const srv = await api('/api/run/finish', a);
-      Object.assign(a, { cnt: srv.cnt, act: srv.act, synced: true });
+      // Keep the server's signed copy so a later re-upload still counts.
+      Object.assign(a, { st: srv.st, fin: srv.fin, act: srv.act, ok: srv.ok, n: srv.n, cnt: srv.cnt, sig: srv.sig, synced: true });
       saveLocal(a);
       await loadState();
       if (route()[1] === a.id) resultView(a.id);
@@ -601,7 +659,15 @@
         <textarea id="imp-text" class="input ta" rows="12" placeholder="1. Which of the following..."></textarea>
         <div class="row-btns"><button class="btn ghost" data-act="imp-check">Check</button><button class="btn primary" data-act="imp-save">Add to question bank</button></div>
         <div id="imp-out" aria-live="polite"></div>
+        <div id="imp-list"></div>
       </section>`, '');
+    drawImports();
+  }
+  async function drawImports() {
+    const list = await api('/api/imports').catch(() => []);
+    const box = document.getElementById('imp-list');
+    if (!box) return;
+    box.innerHTML = list.length ? `<h2 class="imp-h">Added by your team</h2>${list.map((x) => `<div class="imp-row"><span><b>${esc(x.label)}</b><span class="muted"> · ${x.n} questions</span></span><button class="btn ghost sm" data-act="imp-del" data-id="${esc(x.id)}">Remove</button></div>`).join('')}` : '';
   }
   async function doImport(save) {
     const text = document.getElementById('imp-text').value;
@@ -616,6 +682,7 @@
       const r = await api('/api/import', { text, label, save: true });
       S.bank = indexBank(await api('/api/bank'));
       out.innerHTML = report(r.found, r.parsed, r.errors, ` Saved: ${r.added} new question${r.added === 1 ? '' : 's'} added.`);
+      drawImports();
     } catch (e) { out.innerHTML = report(res.found, 0, [e.message]); }
     btn.disabled = false;
   }
@@ -641,26 +708,25 @@
     switch (a) {
       case 'pick-me': return pickMe();
       case 'logout': await fetch('/api/logout', { method: 'POST' }).catch(() => {}); return location.replace('/login');
-      case 'start-mock': { const ex = document.getElementById('src').value; return startRun('mock', ex ? pickExam(ex) : pickMixed(100), ex || null); }
+      case 'start-mock': { const ex = document.getElementById('src').value; return startRun('mock', ex ? pickExam(ex) : pickMixed(100), ex || null, el); }
       case 'start-practice': {
-        const n = +document.querySelector('.seg .on').dataset.n;
+        const n = +document.querySelector('input[name="count"]:checked').value;
         const area = document.getElementById('area').value;
         const mist = document.getElementById('mist').checked;
         const hist = S.state.hist || {};
         const list = S.bank.questions.filter((q) => (!area || q.ar === area) && (!mist || (hist[q.id] && hist[q.id][2] === 0)));
-        return startRun('practice', freshFirst(list).slice(0, n).map((q) => q.id));
+        return startRun('practice', freshFirst(list).slice(0, n).map((q) => q.id), null, el);
       }
-      case 'practice-these': return startRun('practice', shuffle(el.dataset.ids.split(',').filter((id) => S.bank.byId.has(id))));
+      case 'practice-these': return startRun('practice', shuffle(el.dataset.ids.split(',').filter((id) => S.bank.byId.has(id))), null, el);
       case 'resume': location.hash = '#/run'; return;
       case 'discard':
         if (await confirmBox('Discard this exam?', 'Your answers so far will be deleted.', 'Discard', 'Keep it')) { S.run = null; saveRun(); render(); }
         return;
-      case 'seg': el.parentNode.querySelectorAll('button').forEach((x) => { x.classList.toggle('on', x === el); x.setAttribute('aria-checked', String(x === el)); }); return;
       case 'back': return step(-1);
       case 'next':
         if (r.idx === r.qids.length - 1) return r.mode === 'mock' ? finishMock() : finishRun();
         return step(1);
-      case 'flag': { const id = r.qids[r.idx]; if (r.flags[id]) delete r.flags[id]; else r.flags[id] = 1; saveRun(); return drawRun(); }
+      case 'flag': { const id = r.qids[r.idx]; if (r.flags[id]) delete r.flags[id]; else r.flags[id] = 1; saveRun(); return drawRun('flag'); }
       case 'nav': return openNav();
       case 'finish': return finishMock();
       case 'exit':
@@ -672,14 +738,20 @@
         return;
       case 'imp-check': return doImport(false);
       case 'imp-save': return doImport(true);
+      case 'imp-del':
+        if (await confirmBox('Remove this set?', 'Its questions leave the question bank. Results already logged stay.', 'Remove', 'Keep it')) {
+          try { await api('/api/import/delete', { id: el.dataset.id }); S.bank = indexBank(await api('/api/bank')); drawImports(); } catch (e) { toast(e.message); }
+        }
+        return;
     }
   }
   addEventListener('keydown', (e) => {
-    if (route()[0] !== 'run' || !S.run || e.metaKey || e.ctrlKey || e.altKey || document.querySelector('.modal')) return;
+    if (e.wake || route()[0] !== 'run' || !S.run || e.metaKey || e.ctrlKey || e.altKey || document.querySelector('dialog[open]')) return;
     if (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
     const k = e.key.toLowerCase();
     const i = k.length === 1 ? Math.max('abcd'.indexOf(k), '1234'.indexOf(k)) : -1;
     if (i >= 0) { e.preventDefault(); return choose(i); }
+    if (k === 'enter' && e.target.closest('button, a, summary')) return; // Enter on a focused control does that control
     if (k === 'enter' || k === 'arrowright') {
       const b = document.querySelector('.run-bar .btn.primary:not([disabled])');
       if (b) { e.preventDefault(); b.click(); }
@@ -702,6 +774,7 @@
       return;
     }
     if (!S.state.team.includes(S.me)) S.me = null;
+    loadRun();
     render();
     if (!S.me) pickMe();
     resync();
