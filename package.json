@@ -1,0 +1,15 @@
+{
+  "name": "deca-prep",
+  "private": true,
+  "description": "DECA Marketing Cluster Exam practice with team streaks",
+  "scripts": {
+    "start": "node server.js",
+    "build-bank": "node scripts/build-bank.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "redis": "^4.7.0"
+  }
+}
