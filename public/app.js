@@ -54,7 +54,7 @@
     const r = await fetch(url, body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     if (r.status === 401) { location.replace('/login'); throw new Error('locked'); }
     const d = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(d.error || 'Something went wrong');
+    if (!r.ok) throw Object.assign(new Error(d.error || 'Something went wrong'), { status: r.status });
     return d;
   }
   const loadState = async () => (S.state = await api('/api/state?me=' + encodeURIComponent(S.me || '')));
@@ -75,11 +75,14 @@
   }
   async function resync() {
     try {
-      const all = S.state.team.flatMap(localAtts);
+      const all = S.state.team.flatMap(localAtts).filter((a) => !a.rejected);
       if (!all.length) return;
       const { missing } = await api('/api/sync', { ids: all.map((a) => a.id) });
       if (!missing.length) return;
       await api('/api/sync', { attempts: all.filter((a) => missing.includes(a.id)) });
+      // Anything the server still refuses (never started there, or expired) stays local; stop re-sending it.
+      const still = new Set((await api('/api/sync', { ids: missing })).missing);
+      all.filter((a) => still.has(a.id)).forEach((a) => saveLocal({ ...a, cnt: false, rejected: true }));
       await loadState();
       if (route()[0] === '') render();
     } catch { /* retried next visit */ }
@@ -195,6 +198,8 @@
     d.innerHTML = inner;
     document.body.appendChild(d);
     d.addEventListener('cancel', (e) => { if (locked) e.preventDefault(); });
+    // Chrome lets a second Esc close a dialog even when cancel is prevented, so block the key itself too.
+    if (locked) d.addEventListener('keydown', (e) => { if (e.key === 'Escape') e.preventDefault(); });
     d.addEventListener('close', () => { d.remove(); if (back && document.contains(back)) back.focus(); });
     d.addEventListener('click', (e) => {
       if (locked || e.target !== d) return;
@@ -215,6 +220,7 @@
   function pickMe() {
     const d = modalEl(`<h2 id="dlg-title">Who's studying?</h2><p class="muted">Tests on this device are logged under this name.</p>
       <div class="pick">${S.state.team.map((n) => `<button data-me="${esc(n)}"${n === S.me ? ' aria-current="true" autofocus' : ''}>${avatar(n, 'lg')}<span>${esc(n)}</span></button>`).join('')}</div>`, !S.me);
+    d.addEventListener('close', () => { if (!S.me) setTimeout(pickMe, 0); }); // a name must be picked first
     d.addEventListener('click', async (e) => {
       const b = e.target.closest('[data-me]');
       if (!b) return;
@@ -424,6 +430,9 @@
   // focus: where keyboard/screen-reader focus lands after the redraw ('fb' = feedback, 'flag', or the question)
   function drawRun(focus) {
     const r = S.run;
+    // If an imported set is removed mid-test, skip its questions instead of losing the whole test.
+    const kept = r.qids.filter((id) => S.bank.byId.has(id));
+    if (kept.length !== r.qids.length) { r.qids = kept; r.idx = Math.min(r.idx, Math.max(0, kept.length - 1)); saveRun(); }
     const q = S.bank.byId.get(r.qids[r.idx]);
     if (!q) { S.run = null; saveRun(); location.hash = '#/'; return; }
     const mock = r.mode === 'mock';
@@ -553,13 +562,21 @@
       saveLocal(a);
       await loadState();
       if (route()[1] === a.id) resultView(a.id);
-    } catch { toast('Saved on this device. It will upload automatically next time you open the site.'); }
+    } catch (e) {
+      if (e.status === 409) { // the server never started this test (or it expired): it can't count
+        Object.assign(a, { cnt: false, rejected: true });
+        saveLocal(a);
+        toast(e.message);
+        if (route()[1] === a.id) resultView(a.id);
+      } else if (e.message !== 'locked') toast('Saved on this device. It will upload automatically next time you open the site.');
+    }
   }
 
   // ---------- results
   const ring = (p) => `<svg viewBox="0 0 120 120" class="ring-svg" role="img" aria-label="${p} percent"><circle cx="60" cy="60" r="52" class="ring-bg"/><circle cx="60" cy="60" r="52" class="ring-fg ${p >= 70 ? 'good' : p >= 50 ? 'mid' : 'low'}" stroke-dasharray="${((p / 100) * 326.7).toFixed(1)} 326.7" transform="rotate(-90 60 60)"/><text x="60" y="61" class="ring-t">${p}%</text></svg>`;
   function cntReason(a) {
     const rule = S.state.rules, blank = a.rows.filter((x) => x[1] < 0).length;
+    if (a.rejected) return 'the server had no record of it starting (it may have expired)';
     if (a.n < rule.mock) return `it has fewer than ${rule.mock} questions`;
     if (blank) return `${blank} question${blank > 1 ? 's were' : ' was'} left blank`;
     if (a.act < rule.minSec) return `under ${Math.round(rule.minSec / 60)} active minutes`;

@@ -49,8 +49,7 @@ async function redisStore(url) {
     all: (h) => c.hGetAll(h),
     get: async (h, k) => (await c.hGet(h, k)) || null,
     set: (h, k, v) => c.hSet(h, k, v),
-    del: (h, k) => c.hDel(h, k),
-    quit: () => c.quit()
+    del: (h, k) => c.hDel(h, k)
   };
 }
 async function pgStore(url) {
@@ -62,22 +61,8 @@ async function pgStore(url) {
     all: async (h) => Object.fromEntries((await pool.query('select k, v from kv where h = $1', [h])).rows.map((r) => [r.k, r.v])),
     get: async (h, k) => ((await pool.query('select v from kv where h = $1 and k = $2', [h, k])).rows[0] || {}).v || null,
     set: async (h, k, v) => { await pool.query('insert into kv (h, k, v) values ($1, $2, $3) on conflict (h, k) do update set v = excluded.v', [h, k, v]); },
-    del: async (h, k) => { await pool.query('delete from kv where h = $1 and k = $2', [h, k]); },
-    size: async () => Number((await pool.query('select count(*) from kv')).rows[0].count)
+    del: async (h, k) => { await pool.query('delete from kv where h = $1 and k = $2', [h, k]); }
   };
-}
-// One-time copy from the old Key Value store while the new database is still empty.
-async function copyFromKeyValue(db) {
-  if (!process.env.REDIS_URL || (await db.size()) > 0) return;
-  try {
-    const old = await redisStore(process.env.REDIS_URL);
-    let n = 0;
-    for (const h of ['dp:att', 'dp:run', 'dp:imp']) {
-      for (const [k, v] of Object.entries(await old.all(h))) { await db.set(h, k, v); n++; }
-    }
-    await old.quit();
-    console.log(`copied ${n} records from Key Value`);
-  } catch (e) { console.error('Key Value copy skipped:', e.message); }
 }
 const STORE_KIND = process.env.DATABASE_URL ? 'postgres' : process.env.REDIS_URL ? 'redis' : 'file';
 let store;
@@ -160,8 +145,9 @@ function makeAttempt(b, fin, trusted) {
   // Active time comes from the page (it pauses when the tab is hidden or idle); it can never exceed wall-clock time.
   const act = Math.max(0, Math.min(Math.round(Number(b.act) || 0), Math.round((fin - st) / 1000) + 5));
   const cnt = !!trusted && mode === 'mock' && rows.length >= MOCK_SIZE && answered >= rows.length && act >= MIN_ACTIVE_SEC;
-  // A test belongs to the day it started, so one that runs past midnight still counts for that day.
-  const att = { id: b.id, m, mode, ex: b.ex ? String(b.ex).slice(0, 40) : null, st, fin, act, n: rows.length, ok: g.ok, cnt, day: dayKey(st), rows };
+  // A test belongs to the day it started (so finishing just past midnight still counts for that day),
+  // unless it sat open for hours: then the finish day, so an old unfinished test can't fill a missed day.
+  const att = { id: b.id, m, mode, ex: b.ex ? String(b.ex).slice(0, 40) : null, st, fin, act, n: rows.length, ok: g.ok, cnt, day: dayKey(fin - st < 6 * 3600e3 ? st : fin), rows };
   att.sig = attSig(att);
   return att;
 }
@@ -356,8 +342,8 @@ const server = http.createServer(async (req, res) => {
 
 (async () => {
   BASE = loadBase();
-  if (STORE_KIND === 'postgres') { store = await pgStore(process.env.DATABASE_URL); await copyFromKeyValue(store); }
-  else store = STORE_KIND === 'redis' ? await redisStore(process.env.REDIS_URL) : fileStore(path.join(__dirname, 'data', 'dev-store.json'));
+  store = STORE_KIND === 'postgres' ? await pgStore(process.env.DATABASE_URL)
+    : STORE_KIND === 'redis' ? await redisStore(process.env.REDIS_URL) : fileStore(path.join(__dirname, 'data', 'dev-store.json'));
   await rebuildBank();
   server.listen(PORT, () => console.log(`DECA Prep on http://localhost:${PORT}: ${BANK.questions.length} questions, ${BANK.terms.length} terms`));
 })().catch((e) => { console.error(e); process.exit(1); });
