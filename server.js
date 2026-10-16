@@ -26,7 +26,7 @@ const addDays = (k, n) => { const d = new Date(k + 'T12:00:00Z'); d.setUTCDate(d
 const START = process.env.START_DATE || dayKey(Date.now());
 const bad = (msg, status = 400) => Object.assign(new Error(msg), { status });
 
-// ---------- storage: Render Key Value in production, a JSON file locally
+// ---------- storage: Neon Postgres in production (Key Value or a JSON file as fallbacks)
 function fileStore(file) {
   let db = {};
   try { db = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { /* first run */ }
@@ -47,9 +47,37 @@ async function redisStore(url) {
     all: (h) => c.hGetAll(h),
     get: async (h, k) => (await c.hGet(h, k)) || null,
     set: (h, k, v) => c.hSet(h, k, v),
-    del: (h, k) => c.hDel(h, k)
+    del: (h, k) => c.hDel(h, k),
+    quit: () => c.quit()
   };
 }
+async function pgStore(url) {
+  const { Pool } = require('pg');
+  const pool = new Pool({ connectionString: url.replace('sslmode=require', 'sslmode=verify-full'), max: 4, idleTimeoutMillis: 60e3 });
+  pool.on('error', (e) => console.error('pg idle client:', e.message)); // Neon drops idle connections when it suspends
+  await pool.query('create table if not exists kv (h text not null, k text not null, v text not null, primary key (h, k))');
+  return {
+    all: async (h) => Object.fromEntries((await pool.query('select k, v from kv where h = $1', [h])).rows.map((r) => [r.k, r.v])),
+    get: async (h, k) => ((await pool.query('select v from kv where h = $1 and k = $2', [h, k])).rows[0] || {}).v || null,
+    set: async (h, k, v) => { await pool.query('insert into kv (h, k, v) values ($1, $2, $3) on conflict (h, k) do update set v = excluded.v', [h, k, v]); },
+    del: async (h, k) => { await pool.query('delete from kv where h = $1 and k = $2', [h, k]); },
+    size: async () => Number((await pool.query('select count(*) from kv')).rows[0].count)
+  };
+}
+// One-time copy from the old Key Value store while the new database is still empty.
+async function copyFromKeyValue(db) {
+  if (!process.env.REDIS_URL || (await db.size()) > 0) return;
+  try {
+    const old = await redisStore(process.env.REDIS_URL);
+    let n = 0;
+    for (const h of ['dp:att', 'dp:run', 'dp:imp']) {
+      for (const [k, v] of Object.entries(await old.all(h))) { await db.set(h, k, v); n++; }
+    }
+    await old.quit();
+    console.log(`copied ${n} records from Key Value`);
+  } catch (e) { console.error('Key Value copy skipped:', e.message); }
+}
+const STORE_KIND = process.env.DATABASE_URL ? 'postgres' : process.env.REDIS_URL ? 'redis' : 'file';
 let store;
 
 // ---------- question bank (bank.enc is AES-256-GCM; the key lives only in env)
@@ -259,7 +287,7 @@ async function api(req, res, url) {
   if (p === '/api/health') {
     const t = Date.now();
     await store.all('dp:run'); // proves the store answers
-    return json(res, 200, { ok: true, questions: BANK.questions.length, terms: BANK.terms.length, store: process.env.REDIS_URL ? 'redis' : 'file', storeMs: Date.now() - t });
+    return json(res, 200, { ok: true, questions: BANK.questions.length, terms: BANK.terms.length, store: STORE_KIND, storeMs: Date.now() - t });
   }
   if (p === '/api/login' && req.method === 'POST') return login(req, res);
   if (p === '/api/logout' && req.method === 'POST') { res.setHeader('Set-Cookie', cookie('', 0)); return json(res, 200, { ok: true }); }
@@ -300,7 +328,8 @@ const server = http.createServer(async (req, res) => {
 
 (async () => {
   BASE = loadBase();
-  store = process.env.REDIS_URL ? await redisStore(process.env.REDIS_URL) : fileStore(path.join(__dirname, 'data', 'dev-store.json'));
+  if (STORE_KIND === 'postgres') { store = await pgStore(process.env.DATABASE_URL); await copyFromKeyValue(store); }
+  else store = STORE_KIND === 'redis' ? await redisStore(process.env.REDIS_URL) : fileStore(path.join(__dirname, 'data', 'dev-store.json'));
   await rebuildBank();
   server.listen(PORT, () => console.log(`DECA Prep on http://localhost:${PORT}: ${BANK.questions.length} questions, ${BANK.terms.length} terms`));
 })().catch((e) => { console.error(e); process.exit(1); });
